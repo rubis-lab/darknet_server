@@ -914,9 +914,15 @@ printf("Server for layer %d\n", i);
             net.truth_gpu = l.output_gpu;
             net.truth = l.output;
         }
-    }
-    pull_network_output(netp);
-    calc_network_cost(netp);
+	}
+	/* Send data to client */
+	layer l = net.layers[net.n-1];
+	msg_size = l.batch * l.outputs;
+	cuda_pull_array(net.input_gpu, (float *)msg_socket, msg_size);
+	printf("Write: %d Bytes\n", sizeof(float)*msg_size);
+	write(client_sockfd, msg_socket, sizeof(float) * msg_size);
+//    pull_network_output(netp);
+//    calc_network_cost(netp);
 
 	/* Added for server-client communication
 	   RUBIS
