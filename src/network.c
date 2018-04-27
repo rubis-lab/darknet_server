@@ -841,7 +841,6 @@ void forward_network_gpu_sock(network *netp, int client_sockfd)
         	net.input = l.output;
 			continue;
 		}
-		printf("Read\n");
 		int read_count = 0;
 		msg_size = l.batch * l.inputs;
 		while (read_count < sizeof(float) * msg_size)
