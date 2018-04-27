@@ -2,6 +2,7 @@
 
 #include <sys/time.h>
 #include <assert.h>
+#include <unistd.h>
 
 float *get_regression_values(char **labels, int n)
 {
@@ -546,10 +547,10 @@ void try_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filena
         if (filename) break;
     }
 }
-
+network *net;
 void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top)
 {
-    network *net = load_network(cfgfile, weightfile, 0);
+    net = load_network(cfgfile, weightfile, 0);
     set_batch_network(net, 1);
     srand(2222222);
 
@@ -582,10 +583,19 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
 
         float *X = r.data;
         time=clock();
+	struct timeval time1, time2, time3, time4;
+printf("Starting...\n");
+gettimeofday(&time1, NULL);
         float *predictions = network_predict(net, X);
+gettimeofday(&time2, NULL);
         if(net->hierarchy) hierarchy_predictions(predictions, net->outputs, net->hierarchy, 1, 1);
+gettimeofday(&time3, NULL);
         top_k(predictions, net->outputs, top, indexes);
-        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, sec(clock()-time));
+gettimeofday(&time4, NULL);
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time3.tv_sec-time2.tv_sec + (time3.tv_usec-time2.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time4.tv_sec-time3.tv_sec + (time4.tv_usec-time3.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds. (calculated by clock())\n", input, sec(clock()-time));
         for(i = 0; i < top; ++i){
             int index = indexes[i];
             //if(net->hierarchy) printf("%d, %s: %f, parent: %s \n",index, names[index], predictions[index], (net->hierarchy->parent[index] >= 0) ? names[net->hierarchy->parent[index]] : "Root");
@@ -598,6 +608,65 @@ void predict_classifier(char *datacfg, char *cfgfile, char *weightfile, char *fi
     }
 }
 
+void predict_classifier_again(char *datacfg, char *cfgfile, char *weightfile, char *filename, int top)
+{
+//    network *net = load_network(cfgfile, weightfile, 0);
+    set_batch_network(net, 1);
+    srand(2222222);
+
+    list *options = read_data_cfg(datacfg);
+
+    char *name_list = option_find_str(options, "names", 0);
+    if(!name_list) name_list = option_find_str(options, "labels", "data/labels.list");
+    if(top == 0) top = option_find_int(options, "top", 1);
+
+    int i = 0;
+    char **names = get_labels(name_list);
+    clock_t time;
+    int *indexes = calloc(top, sizeof(int));
+    char buff[256];
+    char *input = buff;
+    while(1){
+        if(filename){
+            strncpy(input, filename, 256);
+        }else{
+            printf("Enter Image Path: ");
+            fflush(stdout);
+            input = fgets(input, 256, stdin);
+            if(!input) return;
+            strtok(input, "\n");
+        }
+        image im = load_image_color(input, 0, 0);
+        image r = letterbox_image(im, net->w, net->h);
+        //resize_network(net, r.w, r.h);
+        //printf("%d %d\n", r.w, r.h);
+
+        float *X = r.data;
+        time=clock();
+	struct timeval time1, time2, time3, time4;
+printf("Starting...\n");
+gettimeofday(&time1, NULL);
+        float *predictions = network_predict(net, X);
+gettimeofday(&time2, NULL);
+        if(net->hierarchy) hierarchy_predictions(predictions, net->outputs, net->hierarchy, 1, 1);
+gettimeofday(&time3, NULL);
+        top_k(predictions, net->outputs, top, indexes);
+gettimeofday(&time4, NULL);
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time3.tv_sec-time2.tv_sec + (time3.tv_usec-time2.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds.\n", input, (time4.tv_sec-time3.tv_sec + (time4.tv_usec-time3.tv_usec)*0.000001f));
+        fprintf(stderr, "%s: Predicted in %f seconds. (calculated by clock())\n", input, sec(clock()-time));
+        for(i = 0; i < top; ++i){
+            int index = indexes[i];
+            //if(net->hierarchy) printf("%d, %s: %f, parent: %s \n",index, names[index], predictions[index], (net->hierarchy->parent[index] >= 0) ? names[net->hierarchy->parent[index]] : "Root");
+            //else printf("%s: %f\n",names[index], predictions[index]);
+            printf("%5.2f%%: %s\n", predictions[index]*100, names[index]);
+        }
+        if(r.data != im.data) free_image(r);
+        free_image(im);
+        if (filename) break;
+    }
+}
 
 void label_classifier(char *datacfg, char *filename, char *weightfile)
 {

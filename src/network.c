@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <assert.h>
+#include <unistd.h>
 #include "network.h"
 #include "image.h"
 #include "data.h"
@@ -30,6 +31,11 @@
 #include "parser.h"
 #include "data.h"
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
 load_args get_base_args(network *net)
 {
     load_args args = {0};
@@ -47,7 +53,46 @@ load_args get_base_args(network *net)
     args.hue = net->hue;
     return args;
 }
+/* RUBIS
+   for socket programming */
+void forward_network_gpu_sock(network *netp, int client_sockfd);
+void forward_network_sock(network *netp, int client_sockfd)
+{
+#ifdef GPU
+    if(netp->gpu_index >= 0){
+        forward_network_gpu_sock(netp, client_sockfd);   
+        return;
+    }
+#endif
+    network net = *netp;
+    int i;
+    for(i = 0; i < net.n; ++i){
+        net.index = i;
+        layer l = net.layers[i];
+        if(l.delta){
+            fill_cpu(l.outputs * l.batch, 0, l.delta, 1);
+        }
+        l.forward(l, net);
+        net.input = l.output;
+        if(l.truth) {
+            net.truth = l.output;
+        }
+    }
+    calc_network_cost(netp);
+}
+float *network_predict_sock(network *net, float *input, int client_sockfd)
+{
+    network orig = *net;
+    net->input = input;
+    net->truth = 0;
+    net->train = 0;
+    net->delta = 0;
 
+	forward_network_sock(net, client_sockfd);
+    float *out = net->output;
+    *net = orig;
+    return out;
+}
 network *load_network(char *cfg, char *weights, int clear)
 {
     network *net = parse_network_cfg(cfg);
@@ -710,23 +755,160 @@ float *network_output(network *net)
 
 #ifdef GPU
 
-void forward_network_gpu(network *netp)
+void forward_network_gpu_sock(network *netp, int client_sockfd)
 {
+
     network net = *netp;
+
+    int i,j;
+    j=0;
+	
+	/* Added for load server-client processing part
+	   RUBIS
+		1: for client
+		0: for server
+	*/
+	FILE* file = fopen("server_config.txt","r");
+	if (file < 0)
+	{
+		printf("no file: server_config.txt\n");
+		exit(-1);
+	}
+	int *config = (int*)malloc(net.n * sizeof(int));
+	i=0;
+	while (!feof(file)){
+		fscanf(file, "%d", config+i);
+		i++;
+		if (net.n == i)
+			break;
+	}
+	if (i < net.n){
+		printf("Check server_config.txt\n");
+		printf("\tSize is small than network\n");
+		exit(-1);
+	}
+	printf("Read Server config... OK!\n");
+	/*
+	for (i=0; i<net.n; ++i)
+		printf("%d\n", *(config+i));
+	*/
+	
+	/* [Server] End */
+
+	/* [Client] Start */
+	/*
+	struct sockaddr_in clientaddr;
+	int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	clientaddr.sin_family = AF_INET;
+	clientaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+	clientaddr.sin_port = htons(port);
+	int client_len = sizeof(clientaddr);
+
+	if (connect(client_sockfd, (struct sockaddr *)&clientaddr, client_len) < 0)
+	{
+		printf("Connect Error\n");
+		exit(-1);
+	}
+	*/
+	/* [Client] End */
+	
+
+
+	int msg_size = net.inputs * net.batch;
+	char * msg_socket = (float*)malloc(sizeof(float) * net.layers[0].outputs * net.layers[0].batch);
+	/* End */
+
     cuda_set_device(net.gpu_index);
     cuda_push_array(net.input_gpu, net.input, net.inputs*net.batch);
     if(net.truth){
         cuda_push_array(net.truth_gpu, net.truth, net.truths*net.batch);
     }
 
-    int i;
-    for(i = 0; i < net.n; ++i){
+        cudaDeviceSynchronize();
+
+	
+
+	/* for layer 0 */
+    for (i=0; i< 1; ++i){
+		struct timeval time1, time2;
         net.index = i;
         layer l = net.layers[i];
         if(l.delta_gpu){
             fill_gpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
         }
+		if (*(config+i) == 1){ // 1 for client
+        	net.input_gpu = l.output_gpu;
+        	net.input = l.output;
+			continue;
+		}
+		printf("Read\n");
+		int read_count = 0;
+		msg_size = l.batch * l.inputs;
+		while (read_count < sizeof(float) * msg_size)
+		{
+				read_count += read(client_sockfd, msg_socket + read_count, sizeof(float) * msg_size - read_count);
+
+		}
+		printf("Read: %d bytes\n", read_count);
+			cuda_push_array(net.input_gpu, (float *)msg_socket, msg_size);
+printf("Server for layer %d\n", i);
+        cudaDeviceSynchronize();
+		gettimeofday(&time1, NULL);
         l.forward_gpu(l, net);
+        cudaDeviceSynchronize();
+		gettimeofday(&time2, NULL);
+		fprintf(stderr, "layer %d: Predicted in %f seconds.\n", i, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
+        net.input_gpu = l.output_gpu;
+        net.input = l.output;
+        if(l.truth) {
+            net.truth_gpu = l.output_gpu;
+            net.truth = l.output;
+        }
+    }
+
+	/* for other layers */
+    for(i = 1; i < net.n; ++i){
+		layer l = net.layers[i-1];
+		/* have to communication with message net.input_gpu */
+		if (*(config+i) == 1){ // 1 for client
+			if (*(config+i-1) == 0){
+				/* Send data to client */
+				msg_size = l.batch * l.outputs;
+				cuda_pull_array(net.input_gpu, (float *)msg_socket, msg_size);
+				printf("Write: %d Bytes\n", sizeof(float)*msg_size);
+				write(client_sockfd, msg_socket, sizeof(float) * msg_size);
+
+			}
+        	net.input_gpu = net.layers[i].output_gpu;
+        	net.input = net.layers[i].output;
+			continue;
+		}
+		if (*(config+i-1) == 1){
+			/* Read data from client */
+			int read_count = 0;
+			msg_size = l.batch * l.outputs;
+			while (read_count < sizeof(float) * msg_size)
+			{
+				read_count += read(client_sockfd, msg_socket + read_count, sizeof(float) * msg_size - read_count);
+
+			}
+	printf("Read: %d Bytes\n", read_count);
+			cuda_push_array(net.input_gpu, (float *)msg_socket, msg_size);
+		}
+
+printf("Server for layer %d\n", i);
+		struct timeval time1, time2;
+        net.index = i;
+        l = net.layers[i];
+        if(l.delta_gpu){
+            fill_gpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
+        }
+        cudaDeviceSynchronize();
+		gettimeofday(&time1, NULL);
+        l.forward_gpu(l, net);
+        cudaDeviceSynchronize();
+		gettimeofday(&time2, NULL);
+		fprintf(stderr, "layer %d: Predicted in %f seconds.\n", i, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
         net.input_gpu = l.output_gpu;
         net.input = l.output;
         if(l.truth) {
@@ -736,6 +918,176 @@ void forward_network_gpu(network *netp)
     }
     pull_network_output(netp);
     calc_network_cost(netp);
+
+	/* Added for server-client communication
+	   RUBIS
+	   */
+	free(config);
+	free(msg_socket);
+	close(client_sockfd);
+	/* End */
+}
+void forward_network_gpu(network *netp)
+{
+
+    network net = *netp;
+
+    int i,j;
+    j=0;
+	
+	/* Added for load server-client processing part
+	   RUBIS
+		1: for client
+		0: for server
+	*/
+	FILE* file = fopen("server_config.txt","r");
+	if (file < 0)
+	{
+		printf("no file: server_config.txt\n");
+		exit(-1);
+	}
+	int *config = (int*)malloc(net.n * sizeof(int));
+	i=0;
+	while (!feof(file)){
+		fscanf(file, "%d", config+i);
+		i++;
+		if (net.n == i)
+			break;
+	}
+	if (i < net.n){
+		printf("Check server_config.txt\n");
+		printf("\tSize is small than network\n");
+		exit(-1);
+	}
+	printf("Read Server config... OK!\n");
+	/*
+	for (i=0; i<net.n; ++i)
+		printf("%d\n", *(config+i));
+	*/
+
+	int client_sockfd = 0;	
+	/* [Client] Start */
+	/*
+	struct sockaddr_in clientaddr;
+	int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	clientaddr.sin_family = AF_INET;
+	clientaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+	clientaddr.sin_port = htons(port);
+	int client_len = sizeof(clientaddr);
+
+	if (connect(client_sockfd, (struct sockaddr *)&clientaddr, client_len) < 0)
+	{
+		printf("Connect Error\n");
+		exit(-1);
+	}
+	*/
+	/* [Client] End */
+	
+
+
+	int msg_size = net.inputs * net.batch;
+	char * msg_socket = (float*)malloc(sizeof(float) * net.layers[0].outputs * net.layers[0].batch);
+	/* End */
+
+    cuda_set_device(net.gpu_index);
+    cuda_push_array(net.input_gpu, net.input, net.inputs*net.batch);
+    if(net.truth){
+        cuda_push_array(net.truth_gpu, net.truth, net.truths*net.batch);
+    }
+
+        cudaDeviceSynchronize();
+
+	
+
+	/* for layer 0 */
+    for (i=0; i< 1; ++i){
+		struct timeval time1, time2;
+        net.index = i;
+        layer l = net.layers[i];
+        if(l.delta_gpu){
+            fill_gpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
+        }
+		if (*(config+i) == 1){ // 1 for client
+        	net.input_gpu = l.output_gpu;
+        	net.input = l.output;
+			continue;
+		}
+printf("Server for layer %d\n", i);
+        cudaDeviceSynchronize();
+		gettimeofday(&time1, NULL);
+        l.forward_gpu(l, net);
+        cudaDeviceSynchronize();
+		gettimeofday(&time2, NULL);
+		fprintf(stderr, "layer %d: Predicted in %f seconds.\n", i, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
+        net.input_gpu = l.output_gpu;
+        net.input = l.output;
+        if(l.truth) {
+            net.truth_gpu = l.output_gpu;
+            net.truth = l.output;
+        }
+    }
+
+	/* for other layers */
+    for(i = 1; i < net.n; ++i){
+		layer l = net.layers[i-1];
+		/* have to communication with message net.input_gpu */
+		if (*(config+i) == 1){ // 1 for client
+			if (*(config+i-1) == 0){
+				/* Send data to client */
+				msg_size = l.batch * l.outputs;
+				cuda_pull_array(net.input_gpu, (float *)msg_socket, msg_size);
+				printf("Write\n");
+				write(client_sockfd, msg_socket, sizeof(float) * msg_size);
+
+			}
+        	net.input_gpu = net.layers[i].output_gpu;
+        	net.input = net.layers[i].output;
+			continue;
+		}
+		if (*(config+i-1) == 1){
+			/* Read data from client */
+			printf("Read\n");
+			int read_count = 0;
+			msg_size = l.batch * l.outputs;
+			while (read_count < sizeof(float) * msg_size)
+			{
+				read_count += read(client_sockfd, msg_socket + read_count, sizeof(float) * msg_size - read_count);
+
+			}
+	printf("Read %d bytes\n", read_count);
+			cuda_push_array(net.input_gpu, (float *)msg_socket, msg_size);
+		}
+
+printf("Server for layer %d\n", i);
+		struct timeval time1, time2;
+        net.index = i;
+        l = net.layers[i];
+        if(l.delta_gpu){
+            fill_gpu(l.outputs * l.batch, 0, l.delta_gpu, 1);
+        }
+        cudaDeviceSynchronize();
+		gettimeofday(&time1, NULL);
+        l.forward_gpu(l, net);
+        cudaDeviceSynchronize();
+		gettimeofday(&time2, NULL);
+		fprintf(stderr, "layer %d: Predicted in %f seconds.\n", i, (time2.tv_sec-time1.tv_sec + (time2.tv_usec-time1.tv_usec)*0.000001f));
+        net.input_gpu = l.output_gpu;
+        net.input = l.output;
+        if(l.truth) {
+            net.truth_gpu = l.output_gpu;
+            net.truth = l.output;
+        }
+    }
+    pull_network_output(netp);
+    calc_network_cost(netp);
+
+	/* Added for server-client communication
+	   RUBIS
+	   */
+	free(config);
+	free(msg_socket);
+	close(client_sockfd);
+	/* End */
 }
 
 void backward_network_gpu(network *netp)
